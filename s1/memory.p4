@@ -7,7 +7,7 @@
  * KONSTANSOK
  *************************************************************************/
 
-const bit<16> ETHERTYPE_MEM = 0x1234;  // egyedi EtherType a mi protokollunknak
+const bit<16> ETHERTYPE_MEM = 0x1234;
 
 const bit<8>  OPCODE_READ   = 0x01;
 const bit<8>  OPCODE_WRITE  = 0x02;
@@ -17,6 +17,9 @@ const bit<8>  OPCODE_UNLOCK = 0x04;
 const bit<8>  STATUS_OK     = 0x00;
 const bit<8>  STATUS_LOCKED = 0x01;
 const bit<8>  STATUS_ERROR  = 0x02;
+
+// 20 másodperc mikroszekundumban
+const bit<48> LOCK_TIMEOUT  = 20000000;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -92,11 +95,36 @@ control MyIngress(inout headers_t hdr,
     // 1024 darab 48 bites lock tulajdonos (MAC cím), 0 = szabad
     register<bit<48>>(1024) lock_owner;
 
-    // --- SEGÉDVÁLTOZÓK ---
-    bit<32> mem_value;    // ide olvassuk ki a memory register értékét
-    bit<48> owner;        // ide olvassuk ki a lock_owner register értékét
+    // 1024 darab 48 bites timestamp – mikor lett lockozva (mikroszekundum)
+    register<bit<48>>(1024) lock_time;
 
-    
+    // --- SEGÉDVÁLTOZÓK ---
+    bit<32> mem_value;   // ide olvassuk ki a memory register értékét
+    bit<48> owner;       // ide olvassuk ki a lock_owner register értékét
+    bit<48> locked_at;   // ide olvassuk ki a lock_time register értékét
+    bit<48> elapsed;     // ennyi idő telt el a lock megszerzése óta
+
+
+    // --- SEGÉDFÜGGVÉNY: lejárt-e a lock? ---
+    // visszatér true-val ha a lock lejárt (20 másodpercnél régebbi)
+    action check_timeout() {
+        lock_time.read(locked_at, hdr.mem.address);
+        elapsed = standard_metadata.ingress_global_timestamp - locked_at;
+    }
+
+    // --- SEGÉDFÜGGVÉNY: lock megszerzése ---
+    // beállítja a lock_owner-t és a lock_time-t
+    action acquire_lock() {
+        lock_owner.write(hdr.mem.address, hdr.ethernet.srcAddr);
+        lock_time.write(hdr.mem.address, standard_metadata.ingress_global_timestamp);
+    }
+
+    // --- SEGÉDFÜGGVÉNY: lock feloldása ---
+    action release_lock() {
+        lock_owner.write(hdr.mem.address, 0);
+        lock_time.write(hdr.mem.address, 0);
+    }
+
     action send_back() {
         bit<48> tmp;
         tmp = hdr.ethernet.dstAddr;
@@ -104,17 +132,20 @@ control MyIngress(inout headers_t hdr,
         hdr.ethernet.srcAddr = tmp;
         standard_metadata.egress_spec = standard_metadata.ingress_port;
     }
+
     action read() {
         memory.read(mem_value, hdr.mem.address);
         hdr.mem.value = mem_value;
         hdr.mem.status = STATUS_OK;
         send_back();
     }
+
     action write() {
         lock_owner.read(owner, hdr.mem.address);
+
         if (owner == 0) {
             // szabad: mi szerezzük meg a lockot és írunk
-            lock_owner.write(hdr.mem.address, hdr.ethernet.srcAddr);
+            acquire_lock();
             memory.write(hdr.mem.address, hdr.mem.value);
             hdr.mem.status = STATUS_OK;
             send_back();
@@ -124,16 +155,28 @@ control MyIngress(inout headers_t hdr,
             hdr.mem.status = STATUS_OK;
             send_back();
         } else {
-            // valaki más a tulajdonos: visszautasítjuk
-            hdr.mem.status = STATUS_LOCKED;
-            send_back();
+            // valaki más a tulajdonos – megnézzük lejárt-e
+            check_timeout();
+            if (elapsed >= LOCK_TIMEOUT) {
+                // lejárt: feloldjuk a régi lockot, mi szerezzük meg és írunk
+                acquire_lock();
+                memory.write(hdr.mem.address, hdr.mem.value);
+                hdr.mem.status = STATUS_OK;
+                send_back();
+            } else {
+                // még érvényes lock: visszautasítjuk
+                hdr.mem.status = STATUS_LOCKED;
+                send_back();
+            }
         }
     }
+
     action lock() {
-         lock_owner.read(owner, hdr.mem.address);
+        lock_owner.read(owner, hdr.mem.address);
+
         if (owner == 0) {
             // szabad: mi szerezzük meg a lockot
-            lock_owner.write(hdr.mem.address, hdr.ethernet.srcAddr);
+            acquire_lock();
             hdr.mem.status = STATUS_OK;
             send_back();
         } else if (owner == hdr.ethernet.srcAddr) {
@@ -141,17 +184,27 @@ control MyIngress(inout headers_t hdr,
             hdr.mem.status = STATUS_OK;
             send_back();
         } else {
-            // valaki más a tulajdonos: visszautasítjuk
-            hdr.mem.status = STATUS_LOCKED;
-            send_back();
+            // valaki más a tulajdonos – megnézzük lejárt-e
+            check_timeout();
+            if (elapsed >= LOCK_TIMEOUT) {
+                // lejárt: feloldjuk a régi lockot, mi szerezzük meg
+                acquire_lock();
+                hdr.mem.status = STATUS_OK;
+                send_back();
+            } else {
+                // még érvényes lock: visszautasítjuk
+                hdr.mem.status = STATUS_LOCKED;
+                send_back();
+            }
         }
     }
+
     action unlock() {
         lock_owner.read(owner, hdr.mem.address);
 
         if (owner == hdr.ethernet.srcAddr) {
             // mi vagyunk a tulajdonos: feloldjuk a lockot
-            lock_owner.write(hdr.mem.address, 0);
+            release_lock();
             hdr.mem.status = STATUS_OK;
             send_back();
         } else {
