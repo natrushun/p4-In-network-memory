@@ -6,6 +6,7 @@ The goal of this project is to implement an **in-network memory** system using P
 Data is stored directly inside the switch using P4 **registers**.
 Hosts can read and write this memory by sending specially crafted packets to the switch.
 The in-network memory can be shared between multiple servers, and a **locking mechanism** ensures data consistency when multiple hosts access the same memory location simultaneously.
+
 ---
 
 ## Technologies Used
